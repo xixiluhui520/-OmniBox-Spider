@@ -1,6 +1,6 @@
 /**
 * ============================================================================
-* 樱花动漫资源 - OmniBox 爬虫脚本
+* 樱花动漫资源 - OmniBox 爬虫脚本（添加弹幕支持）
 * ============================================================================
 */
 const axios = require("axios");
@@ -22,6 +22,9 @@ const yinghuaConfig = {
 
 const PAGE_LIMIT = 36;
 
+// 弹幕API配置
+const DANMU_API = process.env.DANMU_API || "";
+
 const axiosInstance = axios.create({
     timeout: 15000,
     httpsAgent: new https.Agent({ keepAlive: true, rejectUnauthorized: false }),
@@ -39,6 +42,164 @@ const logInfo = (message, data = null) => {
 const logError = (message, error) => {
     OmniBox.log("error", `[樱花动漫-DEBUG] ${message}: ${error.message || error}`);
 };
+
+// ========== 弹幕相关函数 ==========
+
+/**
+* 预处理标题，去掉常见干扰项
+*/
+function preprocessTitle(title) {
+    if (!title) return "";
+    return title
+        .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, " ")
+        .replace(/[hH]\.?26[45]/g, " ")
+        .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+        .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ");
+}
+
+/**
+* 将中文数字转换为阿拉伯数字
+*/
+function chineseToArabic(cn) {
+    const map = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+    if (!isNaN(cn)) return parseInt(cn);
+    if (cn.length === 1) return map[cn] || cn;
+    if (cn.length === 2) {
+        if (cn[0] === '十') return 10 + map[cn[1]];
+        if (cn[1] === '十') return map[cn[0]] * 10;
+    }
+    if (cn.length === 3) return map[cn[0]] * 10 + map[cn[2]];
+    return cn;
+}
+
+/**
+* 从标题中提取集数数字
+*/
+function extractEpisode(title) {
+    if (!title) return "";
+    
+    const processedTitle = preprocessTitle(title).trim();
+    
+    // 1. 中文格式：第XX集/话
+    const cnMatch = processedTitle.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+    if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+    
+    // 2. S01E03 格式
+    const seMatch = processedTitle.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+    if (seMatch) return seMatch[1];
+    
+    // 3. EP/E 格式
+    const epMatch = processedTitle.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+    if (epMatch) return epMatch[1];
+    
+    // 4. 括号格式 [03]
+    const bracketMatch = processedTitle.match(/[\[\(【(](\d{1,3})[\]\)】)]/);
+    if (bracketMatch) {
+        const num = bracketMatch[1];
+        if (!["720", "1080", "480"].includes(num)) return num;
+    }
+    
+    return "";
+}
+
+/**
+* 构建用于弹幕匹配的文件名
+*/
+function buildFileNameForDanmu(vodName, episodeTitle) {
+    if (!vodName) return "";
+    
+    if (!episodeTitle || episodeTitle === '正片' || episodeTitle === '播放') {
+        return vodName;
+    }
+    
+    const digits = extractEpisode(episodeTitle);
+    if (digits) {
+        const epNum = parseInt(digits, 10);
+        if (epNum > 0) {
+            if (epNum < 10) {
+                return `${vodName} S01E0${epNum}`;
+            } else {
+                return `${vodName} S01E${epNum}`;
+            }
+        }
+    }
+    
+    return vodName;
+}
+
+/**
+* 匹配弹幕
+*/
+async function matchDanmu(fileName) {
+    if (!DANMU_API || !fileName) {
+        return [];
+    }
+    
+    try {
+        logInfo(`匹配弹幕: ${fileName}`);
+        
+        const matchUrl = `${DANMU_API}/api/v2/match`;
+        const response = await OmniBox.request(matchUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            body: JSON.stringify({ fileName: fileName }),
+        });
+        
+        if (response.statusCode !== 200) {
+            logInfo(`弹幕匹配失败: HTTP ${response.statusCode}`);
+            return [];
+        }
+        
+        const matchData = JSON.parse(response.body);
+        
+        if (!matchData.isMatched) {
+            logInfo("弹幕未匹配到");
+            return [];
+        }
+        
+        const matches = matchData.matches || [];
+        if (matches.length === 0) {
+            return [];
+        }
+        
+        const firstMatch = matches[0];
+        const episodeId = firstMatch.episodeId;
+        const animeTitle = firstMatch.animeTitle || "";
+        const episodeTitle = firstMatch.episodeTitle || "";
+        
+        if (!episodeId) {
+            return [];
+        }
+        
+        let danmakuName = "弹幕";
+        if (animeTitle && episodeTitle) {
+            danmakuName = `${animeTitle} - ${episodeTitle}`;
+        } else if (animeTitle) {
+            danmakuName = animeTitle;
+        } else if (episodeTitle) {
+            danmakuName = episodeTitle;
+        }
+        
+        const danmakuURL = `${DANMU_API}/api/v2/comment/${episodeId}?format=xml`;
+        
+        logInfo(`弹幕匹配成功: ${danmakuName}`);
+        
+        return [
+            {
+                name: danmakuName,
+                url: danmakuURL,
+            },
+        ];
+    } catch (error) {
+        logInfo(`弹幕匹配失败: ${error.message}`);
+        return [];
+    }
+}
+
+// ========== 辅助函数 ==========
 
 /**
 * 解析首页列表
@@ -75,7 +236,6 @@ const parsePageCount = (html, tid) => {
     const $ = cheerio.load(html);
     let maxPage = 1;
 
-    // 方法1: 从分页链接提取
     if (tid) {
         const pattern = new RegExp(`/type/${tid}/(\\d+)/`, 'g');
         let match;
@@ -84,14 +244,12 @@ const parsePageCount = (html, tid) => {
         }
     }
 
-    // 方法2: 从通用分页链接提取
     const pattern2 = /\/type\/[^/]+\/(\d+)\//g;
     let match2;
     while ((match2 = pattern2.exec(html)) !== null) {
         maxPage = Math.max(maxPage, parseInt(match2[1]));
     }
 
-    // 方法3: 从page参数提取
     const pattern3 = /[?&]page(?:no)?=(\d+)/g;
     let match3;
     while ((match3 = pattern3.exec(html)) !== null) {
@@ -102,28 +260,34 @@ const parsePageCount = (html, tid) => {
 };
 
 /**
-* 核心:解析播放源字符串为结构化数组
+* 解析播放源字符串为结构化数组（支持透传参数）
 */
-const parsePlaySources = (fromStr, urlStr) => {
+const parsePlaySources = (fromStr, urlStr, vodName) => {
     logInfo("开始解析播放源字符串", { from: fromStr, url: urlStr });
     const playSources = [];
     if (!fromStr || !urlStr) return playSources;
-
+    
     const froms = fromStr.split('$$$');
     const urls = urlStr.split('$$$');
-
+    
     for (let i = 0; i < froms.length; i++) {
         const sourceName = froms[i] || `线路${i + 1}`;
         const sourceItems = urls[i] ? urls[i].split('#') : [];
-
+        
         const episodes = sourceItems.map(item => {
             const parts = item.split('$');
+            const episodeName = parts[0] || '正片';
+            const actualUrl = parts[1] || parts[0];
+            
+            // 拼接 URL|视频名|集数名
+            const combinedId = `${actualUrl}|${vodName}|${episodeName}`;
+            
             return {
-                name: parts[0] || '正片',
-                playId: parts[1] || parts[0]
+                name: episodeName,
+                playId: combinedId
             };
         }).filter(e => e.playId);
-
+        
         if (episodes.length > 0) {
             playSources.push({
                 name: sourceName,
@@ -142,16 +306,14 @@ const parsePlaySources = (fromStr, urlStr) => {
 */
 async function home(params) {
     logInfo("进入首页");
-    
+
     try {
-        // 获取首页推荐
         const url = yinghuaConfig.host + "/";
         const response = await axiosInstance.get(url, { headers: yinghuaConfig.headers });
         const html = response.data;
-        
+
         const list = parseHomeList(html);
-        
-        // 去重
+
         const seen = new Set();
         const uniqueList = list.filter(item => {
             if (seen.has(item.vod_id)) {
@@ -160,9 +322,9 @@ async function home(params) {
             seen.add(item.vod_id);
             return true;
         });
-        
+
         logInfo(`获取到 ${uniqueList.length} 个首页推荐`);
-        
+
         return {
             class: [
                 { 'type_id': 'guoman', 'type_name': '国产动漫' },
@@ -230,12 +392,11 @@ async function detail(params) {
 
     try {
         const detailUrl = videoId.startsWith('http') ? videoId : yinghuaConfig.host + videoId;
-        
+
         const response = await axiosInstance.get(detailUrl, { headers: yinghuaConfig.headers });
         const html = response.data;
         const $ = cheerio.load(html);
 
-        // 提取标题
         let vod_name = '';
         const titleMatch = html.match(/<div class="detail">.*?<h2>([^<]+)<\/h2>/s);
         if (titleMatch) {
@@ -247,14 +408,12 @@ async function detail(params) {
             }
         }
 
-        // 提取封面
         let vod_pic = '';
         const coverMatch = html.match(/<div class="cover">\s*<img[^>]+data-original="([^"]+)"/);
         if (coverMatch) {
             vod_pic = coverMatch[1];
         }
 
-        // 提取基本信息
         const getInfo = (label, useEm = true) => {
             const pattern = useEm
                 ? new RegExp(`<span>${label}:<\\/span><em>([^<]+)<\\/em>`)
@@ -269,14 +428,12 @@ async function detail(params) {
         const vod_type = getInfo('类型', false);
         const vod_actor = getInfo('主演', false);
 
-        // 提取简介
         let vod_content = '';
         const descMatch = html.match(/class="blurb"[^>]*>.*?<span>[^<]+<\/span>(.*?)<\/li>/s);
         if (descMatch) {
             vod_content = descMatch[1].replace(/<[^>]+>/g, '').trim();
         }
 
-        // 从备注中提取总集数
         let totalEpisodes = 0;
         if (vod_remarks) {
             const epMatch = vod_remarks.match(/[共全更新至第]*(\d+)[集话章]/);
@@ -285,27 +442,23 @@ async function detail(params) {
             }
         }
         if (totalEpisodes === 0) {
-            totalEpisodes = 24; // 默认集数
+            totalEpisodes = 24;
         }
 
-        // 提取视频ID
         const vodId = videoId.replace(/^\/+|\/+$/g, '').split('/').pop();
 
-        // 动态生成播放列表
         const sourceNames = ['高清', 'ikun', '非凡', '量子'];
         const playmap = {};
         const playLines = [];
 
         for (let sourceIdx = 1; sourceIdx <= 4; sourceIdx++) {
             try {
-                // 测试该线路是否可用
                 const testUrl = `${yinghuaConfig.host}/play/${vodId}-${sourceIdx}-1/`;
                 await axiosInstance.get(testUrl, {
                     headers: yinghuaConfig.headers,
                     timeout: 5000
                 });
 
-                // 如果能访问,生成该线路的所有集数
                 const episodes = [];
                 for (let epIdx = 1; epIdx <= totalEpisodes; epIdx++) {
                     const epName = epIdx < 10 ? `第0${epIdx}集` : `第${epIdx}集`;
@@ -319,7 +472,6 @@ async function detail(params) {
                     playLines.push(lineName);
                 }
             } catch (err) {
-                // 该线路不可用,跳过
                 logInfo(`线路 ${sourceNames[sourceIdx - 1]} 不可用`);
                 continue;
             }
@@ -328,8 +480,8 @@ async function detail(params) {
         const vod_play_from = playLines.join('$$$');
         const vod_play_url = playLines.map(line => playmap[line].join('#')).join('$$$');
 
-        // 解析为结构化播放源
-        const playSources = parsePlaySources(vod_play_from, vod_play_url);
+        // 传入视频名
+        const playSources = parsePlaySources(vod_play_from, vod_play_url, vod_name);
 
         logInfo("详情获取成功", { vod_name, sources: playSources.length });
 
@@ -339,7 +491,7 @@ async function detail(params) {
                 vod_name: vod_name,
                 vod_pic: vod_pic,
                 vod_content: vod_content,
-                vod_play_sources: playSources, // 关键:荐片架构必须返回此数组
+                vod_play_sources: playSources,
                 vod_year: vod_year,
                 vod_area: vod_area,
                 vod_actor: vod_actor,
@@ -375,7 +527,6 @@ async function search(params) {
 
         const list = [];
 
-        // 按li切割提取
         const liPattern = /<li>\s*<a class="cover".*?<\/li>/gs;
         const lis = html.match(liPattern) || [];
 
@@ -395,7 +546,6 @@ async function search(params) {
             }
         });
 
-        // 解析总页数
         let maxPage = pg;
         const totalMatch = html.match(/找到\s*<em>(\d+)<\/em>/);
         if (totalMatch) {
@@ -432,8 +582,19 @@ async function play(params) {
     let playUrl = params.playId;
     logInfo(`准备播放 URL: ${playUrl}`);
 
+    let vodName = "";
+    let episodeName = "";
+
+    // 解析透传参数
+    if (playUrl && playUrl.includes('|')) {
+        const parts = playUrl.split('|');
+        playUrl = parts[0];
+        vodName = parts[1] || "";
+        episodeName = parts[2] || "";
+        logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    }
+
     try {
-        // 确保URL格式正确
         if (playUrl && !playUrl.startsWith('http')) {
             playUrl = playUrl.startsWith('/')
                 ? yinghuaConfig.host + playUrl
@@ -445,37 +606,42 @@ async function play(params) {
         const response = await axiosInstance.get(playUrl, { headers: yinghuaConfig.headers });
         const html = response.data;
 
-        // 方法1: Artplayer url
+        let playResponse = {
+            urls: [{ name: "默认线路", url: playUrl }],
+            parse: 0,
+            header: {
+                "User-Agent": yinghuaConfig.headers["User-Agent"],
+                "Referer": yinghuaConfig.host + "/"
+            }
+        };
+
         const urlMatch = html.match(/url:\s*'(https?:\/\/[^']+)'/);
         if (urlMatch) {
             logInfo(`找到播放地址: ${urlMatch[1]}`);
-            return {
-                urls: [{ name: "默认线路", url: urlMatch[1] }],
-                parse: 0,
-                header: {
-                    "User-Agent": yinghuaConfig.headers["User-Agent"],
-                    "Referer": yinghuaConfig.host + "/"
+            playResponse.urls = [{ name: "默认线路", url: urlMatch[1] }];
+        } else {
+            const m3u8Match = html.match(/(https?:\/\/[^\s'"]+\.m3u8(?:\?[^\s'">]*)?)/);
+            if (m3u8Match) {
+                logInfo(`找到m3u8地址: ${m3u8Match[1]}`);
+                playResponse.urls = [{ name: "默认线路", url: m3u8Match[1] }];
+            }
+        }
+
+        // 弹幕匹配
+        if (DANMU_API && vodName) {
+            const fileName = buildFileNameForDanmu(vodName, episodeName);
+            logInfo(`尝试匹配弹幕文件名: ${fileName}`);
+
+            if (fileName) {
+                const danmakuList = await matchDanmu(fileName);
+                if (danmakuList && danmakuList.length > 0) {
+                    playResponse.danmaku = danmakuList;
+                    logInfo(`弹幕已添加到播放响应`);
                 }
-            };
+            }
         }
 
-        // 方法2: 兜底匹配m3u8
-        const m3u8Match = html.match(/(https?:\/\/[^\s'"]+\.m3u8(?:\?[^\s'">]*)?)/);
-        if (m3u8Match) {
-            logInfo(`找到m3u8地址: ${m3u8Match[1]}`);
-            return {
-                urls: [{ name: "默认线路", url: m3u8Match[1] }],
-                parse: 0,
-                header: yinghuaConfig.headers
-            };
-        }
-
-        logInfo("未找到播放地址,返回原URL");
-        return {
-            urls: [{ name: "默认线路", url: playUrl }],
-            parse: 0,
-            header: yinghuaConfig.headers
-        };
+        return playResponse;
     } catch (e) {
         logError("播放地址解析失败", e);
         return {
